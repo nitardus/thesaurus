@@ -36,14 +36,21 @@ Or, if you have the Build::Install module installed, run the following commands:
 	./Build install
 
 
-SUPPORT AND DOCUMENTATION
+Support and Documentation
+-------------------------
 
 After installing, you can find documentation for this module with the
 man or the perldoc command.
 
     man thesaurus
+	
+Alternatively, use its build-in help function
 
-LICENSE AND COPYRIGHT
+    thesaurus -h
+	
+
+License and Copyright
+---------------------
 
 This software is Copyright (c) 2024 by Michael Neidhart.
 

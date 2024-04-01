@@ -26,7 +26,6 @@ my $builder = Module::Build->new
 		'Encode'             => 0,
 		'File::Basename'     => 0,
 		'File::Spec'         => 0,
-		'FindBin'            => 0,
 		'Term::ReadKey'      => 0,
 		'Term::ANSIColor'    => 0,
 		'Unicode::Normalize' => 0,

@@ -7,12 +7,12 @@ use Cwd qw(realpath);
 use Encode qw(encode decode);
 use File::Basename;
 use File::Spec;
-use FindBin qw($Bin);
-use lib File::Spec->catdir($Bin, '..', 'lib');
+# use FindBin qw($Bin);
+# use lib File::Spec->catdir($Bin, '..', 'lib');
 use Lingua::Thesaurus;
 use open qw(:std :encoding(UTF-8));
 use Curses;
-use Data::Dumper;
+# use Data::Dumper;
 
 =head1 NAME
 
@@ -38,9 +38,24 @@ their full name or a alias, only these will be loaded in the specified
 order. If you only want to order some dictionaries but also load the
 rest, finish the dictionary list with and @..
 
-The source directories, load order and aliases can be configured
-interactively with the -c flag or by editing thesaurus' config file
-(usually %HOME/.config/thesaurus/).
+Thesaurus load automatically all dictionary folders contained in its
+configuration directory $HOME/.config/thesaurus/. Other source
+directories, a list of prefered dictionaries and some other
+configuration can be set interactively with the -c flag (which will be
+added automatically, if thesaurus fails to load any dictionary), or by
+editing a thesaurus.conf file in this directory in the following format:
+
+   strictmode 0
+   regexp     0
+
+   [directories]
+   /path/to/a
+   /path/to/b
+
+   [prefered]
+   Dictionary 1
+   Dictionary.2
+
 
 
 =head1 OPTIONS
@@ -253,8 +268,8 @@ sub get_opts {
 sub get_dictionaries {
   my $config_data = File::Spec->catdir( $ENV{HOME}, '.config', 'thesaurus' );
   push @directories, $config_data if -d $config_data;
-  my $distro_data = File::Spec->catdir( $Bin, '..', 'data' );
-  push @directories, $distro_data if -d $distro_data;
+  # my $distro_data = File::Spec->catdir( $Bin, '..', 'data' );
+  # push @directories, $distro_data if -d $distro_data;
 
   my @dirs = @directories; @directories = ();
   for my $directory (@dirs) {
@@ -288,12 +303,12 @@ sub scan_directory {
 sub configure {
   # System dictionaries, have lowest precedence
   my $config_data = File::Spec->catdir( $ENV{HOME}, '.config', 'thesaurus' );
-  my $distro_data = File::Spec->catdir( $Bin, '..', 'data' );
+#  my $distro_data = File::Spec->catdir( $Bin, '..', 'data' );
 
   # Remove system dictionaries for now
   @dictionaries = ();
   @directories = grep {
-    $_ ne $config_data and $_ ne $distro_data
+    $_ ne $config_data # and $_ ne $distro_data
   } @directories;
 
   # Print contents of known directories
@@ -335,7 +350,8 @@ sub configure {
   }
 
   # Print and add system directories
-  my @sysdirs = ($config_data, $distro_data);
+  #my @sysdirs = ($config_data, $distro_data);
+  my @sysdirs = ($config_data);
   for my $sysdir (@sysdirs) {
     if ( my @dicts = scan_directory( $sysdir ) ) {
       say STDERR "SYSTEMDIR $sysdir contains:";
@@ -362,7 +378,7 @@ sub configure {
     }
   }
 
-  # Get additional preferances
+  # Get additional preferences
   print STDERR   "Enter your prefered dictionary  (blank to skip): ";
   while ( chomp( my $pref = <STDIN> ) ) {
     last unless $pref;
