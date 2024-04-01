@@ -1,0 +1,15 @@
+Build.PL
+Changes
+lib/Lingua/Thesaurus.pm
+lib/Lingua/StarDict2.pm
+LICENSE
+Makefile.PL
+MANIFEST			This list of files
+MANIFEST.SKIP
+README.md
+script/thesaurus
+t/00-load.t
+t/manifest.t
+xt/pod-coverage.t
+t/pod.t
+xt/boilerplate.t

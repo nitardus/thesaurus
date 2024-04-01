@@ -1,0 +1,820 @@
+#! /usr/bin/perl
+use strict;
+use warnings;
+use v5.16;
+
+use Cwd qw(realpath);
+use Encode qw(encode decode);
+use File::Basename;
+use File::Spec;
+use FindBin qw($Bin);
+use lib File::Spec->catdir($Bin, '..', 'lib');
+use Lingua::Thesaurus;
+use open qw(:std :encoding(UTF-8));
+use Curses;
+use Data::Dumper;
+
+=head1 NAME
+
+thesaurus - read dictionaries in terminal
+
+=head1 DESCRIPTION
+
+Thesaurus is a lightweight, curses based dictionary reader for the
+command line. Its usage is somewhat inspired by the UNIX less comman.
+Use it to read and search your dictionary files. At the moment, it
+only supports uncompressed StarDict files, but others will be added in
+the future.
+
+=head1 SYNOPSIS
+
+   thesaurus
+   thesaurus [-bsr] [--dir DIRECTORY]  [dict1 dict2 .. dictn] [@]
+   thesaurus [-c|-h]
+
+Calling thesaurus without any arguments loads all dictionaries known
+to thesaurus into memory. But if you specify dictionaries (either will
+their full name or a alias, only these will be loaded in the specified
+order. If you only want to order some dictionaries but also load the
+rest, finish the dictionary list with and @..
+
+The source directories, load order and aliases can be configured
+interactively with the -c flag or by editing thesaurus' config file
+(usually %HOME/.config/thesaurus/).
+
+
+=head1 OPTIONS
+
+Flags:
+  -b      browse mode: get the first (best) match and allow browsing
+          [DEFAULT]
+  -s      strict matching mode (entry must match given string, but
+          ignoring diacritics)
+  -r      make the query a perl regular expression. This is best
+          used in conjunction with strict mode
+  -c      configure thesaurus and exit
+  -h      print this help message
+
+  --dir DIRECTORY
+          specify an additional directory to search for dictionaries
+
+
+=head1 KEY BINDINGS
+
+    q  Q                   * Quit program
+    s  S                   * Enter new search term
+    e ^E j    ^N . RETURN  * One line forward
+    y ^Y k ^K ^P ,         * One line backward
+    z ^F      ^V   SPACE   * One page forward
+    w ^B   ESC-V   DEL     * One page backward
+    f                      * Goto next entry
+    b                      * Goto previous entry
+    /                      * Search forward (diacritics insensitive)
+    ?                      * Search backward (diacritics insensitive)
+    n                      * Goto next occurence
+    N                      * Goto previous occurence
+    u U                    * Undo search highlighting
+    o                      * Switch to next dictionary
+    O                      * Switch to previous dictionary
+   ^S                      * Toggle strict mode (and redo query)
+   ^R                      * Toggle regexp mode (and redo query)
+
+When searching interactively for a string, press ^R to switch between matching strings and matching regular expressions.
+
+=cut
+
+
+#-------------------------------------------------------
+# Optional threads support
+use Config;
+our $threaded;
+our @threads;
+BEGIN {
+  if ( $Config{useithreads} ) {
+    use threads; @threads = (); $threaded = 1;
+  }
+}
+#-------------------------------------------------------
+
+our ($maxrow, $maxcol, $curses);
+our ($thes, $selected);
+
+our @dictionaries;
+our (@directories, @whitelist, @prefered);
+our $query;
+our ($textsearch, $searchdir);
+our $strictmode          = 0;
+our $regexp              = 0;	# for the general query
+our $regexp_buffersearch = 0;	# for searching the buffer
+our $prompt              = "Enter search term: ";
+
+#----------------------------------------------------------------
+# MAIN
+#----------------------------------------------------------------
+
+get_configuration();
+get_opts();
+get_dictionaries() or configure();
+process_prefered_and_whitelisted();
+$threaded ? initialize_threaded() : initialize_unthreaded();
+
+binmode STDIN, ':raw';
+while ( print STDERR $prompt
+	and chomp( $query = <STDIN> ) and $query ) {
+  join_threads() if $threaded and not defined $thes;
+  $query = process_query($query);
+
+  if ( search_for_query() ) {
+    curses_init();
+    print_fontified_curses( $thes->lege_lineas($maxrow) );
+    eval{ curses_loop() };
+    clear_dictionary_buffer();
+    endwin() if $curses; $curses = 0;
+  }
+  else { say STDERR "No match!" }
+  print STDERR $@ if $@;
+}
+
+#----------------------------------------------------------------
+# HELP
+#----------------------------------------------------------------
+
+sub print_help {
+
+  print <<EOT;
+USAGE: thesaurus
+       thesaurus [-bsr] [--dir DIRECTORY]  [dict1 dict2 .. dictn] [@]
+       thesaurus [-c|-h]
+
+Calling thesaurus without any arguments loads all dictionaries known
+to thesaurus into memory. But if you specify dictionaries (either will
+their full name or a alias, only these will be loaded in the specified
+order. If you only want to order some dictionaries but also load the
+rest, finish the dictionary list with and @..
+
+The source directories, load order and aliases can be configured
+interactively with the -c flag or by editing thesaurus' config file
+(usually %HOME/.config/thesaurus/).
+
+Flags:
+  -b      browse mode: get the first (best) match and allow browsing
+          [DEFAULT]
+  -s      strict matching mode (entry must match given string, but
+          ignoring diacritics)
+  -r      make the query a perl regular expression. This is best
+          used in conjunction with strict mode
+  -c      configure thesaurus and exit
+  -h      print this help message
+
+  --dir DIRECTORY
+          specify an additional directory to search for dictionaries
+
+
+Key Bindings:
+    q  Q                   * Quit program
+    s  S                   * Enter new search term
+    e ^E j    ^N . RETURN  * One line forward
+    y ^Y k ^K ^P ,         * One line backward
+    z ^F      ^V   SPACE   * One page forward
+    w ^B   ESC-V   DEL     * One page backward
+    f                      * Goto next entry
+    b                      * Goto previous entry
+    /                      * Search forward (diacritics insensitive)
+    ?                      * Search backward (diacritics insensitive)
+    n                      * Goto next occurence
+    N                      * Goto previous occurence
+    u U                    * Undo search highlighting
+    o                      * Switch to next dictionary
+    O                      * Switch to previous dictionary
+   ^S                      * Toggle strict mode (and redo query)
+   ^R                      * Toggle regexp mode (and redo query)
+
+When searching interactively for a string, press ^R to switch between matching strings and matching regular expressions.
+EOT
+
+exit 0;
+}
+
+#----------------------------------------------------------------
+# INITIALIZATION FUNCTIONS
+#----------------------------------------------------------------
+
+sub get_configuration {
+  my $config_file = File::Spec->catfile
+    ( $ENV{HOME}, '.config', 'thesaurus', 'thesaurus.conf' );
+  return unless -f $config_file;
+  open my $fh, '<', $config_file or die "Cannot read $config_file: $!";
+  my $mode = '';
+  while (<$fh>) {
+    chomp;
+    unless ($mode) {
+      next unless /\S/;
+      if    (/^\s*\Q[prefered]/)     { $mode = 'prefered'    }
+      elsif (/^\s*\Q[directories]/) { $mode = 'directories' }
+      elsif (/^\s*strict\w*\s+(\d)/) { $strictmode = $1      }
+      elsif (/^\s*re\w*\s+(\d)/    ) { $regexp     = $1      }
+      else  { die "Error in configuration file: $_" }
+    }
+    elsif ($mode eq 'prefered') {
+      unless (/\S/) { $mode = ''; next }
+      push @prefered, $_;
+    }
+    elsif ($mode eq 'directories') {
+      unless (/\S/) { $mode = ''; next }
+      s/^~/$ENV{HOME}/;
+      push @directories, $_;
+    }
+  }
+  close $fh;
+}
+
+sub get_opts {
+  while (@ARGV) {
+    local $_ = shift @ARGV;
+    if (/^-[hcbsr]/) {
+      if (/h/) { print_help();              }
+      if (/c/) { configure(); exit 0;       }
+      if (/b/) { $strictmode = $regexp = 0; }
+      if (/s/) { $strictmode = 1;           }
+      if (/r/) { $regexp = 1;               }
+    }
+    elsif (/\Q--dir/) {
+      my $dir = shift @ARGV || die "--dir switch without an argument!\n";
+      $dir = realpath $dir;
+      -d $dir or die "$dir is not a directory!\n";
+      push @directories, $dir;
+    }
+    elsif (/^-/)     { die "Unknown option $_!\n" }
+    else             { s/^\\\\/\//; s/^\\-/-/;
+		       push @whitelist, $_;       }
+  }
+}
+
+sub get_dictionaries {
+  my $config_data = File::Spec->catdir( $ENV{HOME}, '.config', 'thesaurus' );
+  push @directories, $config_data if -d $config_data;
+  my $distro_data = File::Spec->catdir( $Bin, '..', 'data' );
+  push @directories, $distro_data if -d $distro_data;
+
+  my @dirs = @directories; @directories = ();
+  for my $directory (@dirs) {
+    my @dicts = scan_directory( $directory );
+    if (@dicts) {
+      push @directories, $directory;
+      push @dictionaries, @dicts;
+    }
+  }
+  return @dictionaries ? 1 : 0;
+}
+
+sub scan_directory {
+  my $directory = shift; my @dicts;
+  my @dirs = grep -d, glob( File::Spec->catfile( $directory, "*") );
+  my @ifos;
+  for my $dir (@dirs) {
+    push @ifos, glob( File::Spec->catfile( $dir, "*.ifo") );
+  }
+  for my $ifo (@ifos) {
+    my ($name, $path) = fileparse $ifo, '.ifo';
+    warn "Missing file $name.idx\n" and next
+      unless -f File::Spec->catfile( $path, "$name.ifo" );
+    warn "Missing file $name.dict\n" and next
+      unless -f File::Spec->catfile( $path, "$name.dict" );
+    push @dicts, { name => $name, path => $path };
+  }
+  return @dicts;
+}
+
+sub configure {
+  # System dictionaries, have lowest precedence
+  my $config_data = File::Spec->catdir( $ENV{HOME}, '.config', 'thesaurus' );
+  my $distro_data = File::Spec->catdir( $Bin, '..', 'data' );
+
+  # Remove system dictionaries for now
+  @dictionaries = ();
+  @directories = grep {
+    $_ ne $config_data and $_ ne $distro_data
+  } @directories;
+
+  # Print contents of known directories
+  if (@directories) {
+    my @dirs = @directories; @directories = ();
+    for my $dir (@dirs) {
+
+      -d $dir or say STDERR "$dir is not a directory!" and next;
+      my @dicts = scan_directory( $dir )
+	or say STDERR "$dir does not contain any dictionaries!" and next;
+
+      say STDERR "$dir:";
+      say STDERR "\t$_->{name}" for @dicts;
+      print "Add to configuration file? (Y/n): ";
+      next if <STDIN> =~ /n/;
+      push @directories, $dir;
+      push @dictionaries, @dicts;
+    }
+  }
+  else {
+    say STDERR "NONE SPECIFIED";
+  }
+
+  # Get new dictionaries
+  while ( print STDERR "Enter directory (blank to finish): "
+	  and chomp( my $dir = <STDIN> ) ) {
+    last unless $dir;
+    $dir =~ s/^~/$ENV{HOME}/;
+    -d $dir
+      or say STDERR "$dir is not a directory!" and next;
+    my @dicts = scan_directory( $dir )
+     or say STDERR "$dir does not contain any dictionaries!" and next;
+    say   STDERR "Found dictionaries:";
+    say   STDERR "\t$_->{name}" for @dicts;
+    print STDERR "Ok? (Y/n) ";
+    next if <STDIN> =~ /n/;
+    push @directories, realpath($dir);
+    push @dictionaries, @dicts;
+  }
+
+  # Print and add system directories
+  my @sysdirs = ($config_data, $distro_data);
+  for my $sysdir (@sysdirs) {
+    if ( my @dicts = scan_directory( $sysdir ) ) {
+      say STDERR "SYSTEMDIR $sysdir contains:";
+      say STDERR "\t$_->{name}" for @dicts;
+      push @directories, $sysdir;
+      push @dictionaries, @dicts;
+    }
+  }
+
+  die "I have no valid dictionaries! Exiting...\n" unless @dictionaries;
+
+  # Print preferences
+  if (@prefered) {
+    say STDERR "Prefered dictionaries:";
+    my @pref = @prefered; @prefered = ();
+    for my $pref (@pref) {
+      warn "No dictionary $pref in the directories you have given me!\n"
+	and next
+	unless grep { $pref eq $_->{name} } @dictionaries;
+
+      print STDERR "$pref (ok? Y/n): ";
+      next if <STDIN> =~ /n/i;
+      push @prefered, $pref;
+    }
+  }
+
+  # Get additional preferances
+  print STDERR   "Enter your prefered dictionary  (blank to skip): ";
+  while ( chomp( my $pref = <STDIN> ) ) {
+    last unless $pref;
+    warn "No dictionary $pref in the directories you have given me!\n"
+      and next
+      unless grep { $pref eq $_->{name} } @dictionaries;
+    push @prefered, $pref;
+    print STDERR "Add another prefered dictionary (blank to skip): ";
+  }
+
+  # Strict mode
+  print STDERR "Make strict mode default? (y/N) ";
+  $strictmode = 1 if <STDIN> =~ /y/i;
+
+  print STDERR "Make regexp search mode default? (y/N) ";
+  $regexp = 1 if <STDIN> =~ /y/i;
+
+  eval{ write_config_file() };
+}
+
+sub write_config_file {
+  my $config_home = File::Spec->catdir( $ENV{HOME}, '.config' );
+  mkdir $config_home, 0755 unless -d $config_home;
+  my $config_dir = File::Spec->catdir( $config_home, 'thesaurus' );
+  mkdir $config_dir, 0755 unless -d $config_dir;
+  my $config_file = File::Spec->catfile( $config_dir, 'thesaurus.conf' );
+  open my $fh, '>', $config_file or die "Cannot write to $config_file: $!";
+  say { $fh } "strictmode\t$strictmode";
+  say { $fh } "regexp $regexp";
+  say { $fh } "";
+  say { $fh } "[prefered]";
+  say { $fh } $_ for @prefered;
+  say { $fh } "";
+  say { $fh } "[directories]";
+  say { $fh } $_ for @directories;
+  say STDERR "Wrote configuration file to $config_file";
+}
+
+sub process_prefered_and_whitelisted {
+  if (@whitelist and $whitelist[-1] eq '@') {
+    pop @whitelist; @prefered = @whitelist; @whitelist = ();
+  }
+
+  if (@whitelist) {
+    my @dicts;
+    for my $white (@whitelist) {
+      die "Cannot find whitelisted dictionary $white!\n"
+	unless grep { $white eq $_->{name} } @dictionaries;
+      push @dicts, grep { $white eq $_->{name} } @dictionaries;
+    }
+    @dictionaries = @dicts;
+  }
+  elsif (@prefered) {
+    my @ordered;
+    for my $pref (@prefered) {
+      die "Cannot find prefered dictionary $pref!\n"
+	unless grep { $pref eq $_->{name} } @dictionaries;
+      push @ordered,  grep { $pref eq $_->{name} } @dictionaries;
+      @dictionaries = grep { $pref ne $_->{name} } @dictionaries;
+    }
+    unshift @dictionaries, @ordered;
+  }
+}
+
+sub initialize_threaded {
+  for my $i (0..$#dictionaries) {
+    $threads[$i] = threads->create(\&open_dictionaries, $dictionaries[$i]);
+  }
+}
+
+sub initialize_unthreaded {
+  for my $d (@dictionaries) {
+    $d->{dict} = open_dictionaries($d)
+  }
+  $thes = $dictionaries[0]->{dict};
+  $selected = 0;
+}
+
+sub open_dictionaries {
+  my $d = shift;
+  my $dict = Lingua::Thesaurus->aperi
+    ( path      => $d->{path},
+      name      => $d->{name},
+      normalize => 1,
+      raw       => 1,
+      strict    => $strictmode,
+      regexp     => $regexp,
+    );
+  return $dict;
+}
+
+sub join_threads {
+  for my $i (0..$#dictionaries) {
+    $dictionaries[$i]->{dict} = $threads[$i]->join();
+  }
+  $thes = $dictionaries[0]->{dict};
+  $selected = 0;
+}
+
+#----------------------------------------------------------------
+# NCURSES
+#----------------------------------------------------------------
+
+sub process_query {
+  my $query = shift;
+  $query =~ s/^\s+//;
+  $query =~ s/\s+$//;
+  1 while $query =~ s/.[\b]//;
+  $query = decode('UTF-8', $query);
+  # $query =~ s/[^ \w]//g;
+  # say STDERR $query;
+  return $query;
+}
+
+sub search_for_query {
+  for my $i ($selected..$#dictionaries, 0..$selected-1) {
+    my $text  = $dictionaries[$i]->{dict}->quaere($query);
+    $selected = $i; $thes = $dictionaries[$i]->{dict};
+    return $text if $text;
+  }
+  return;
+}
+
+sub curses_init {
+  initscr() and $curses = 1;
+  getmaxyx($maxrow, $maxcol);
+  $maxrow--;
+  curs_set(0);
+  start_color();
+  init_pair(1, COLOR_RED,   COLOR_BLACK);
+  init_pair(2, COLOR_GREEN, COLOR_BLACK);
+  init_pair(3, COLOR_YELLOW, COLOR_BLACK);
+  init_pair(4, COLOR_CYAN, COLOR_BLACK);
+  raw();
+  keypad(1);
+  noecho();
+}
+
+sub curses_loop {
+  my $ch = '';
+  while ($ch !~ /^[Ss]$/) {
+    refresh();
+    my $ch = getch();
+    if    ($ch =~ /^[Qq]$/) { endwin() if $curses;
+			      $curses = 0;
+			      exit 0  }
+    elsif ($ch =~ /^[Ss]$/)        { last }
+    elsif ($ch =~ /^[z ]$/)    { page_forward()        }
+    elsif ($ch eq KEY_NPAGE  )     { page_forward()        }
+    elsif ($ch =~ /^[w\177\b]$/) { page_backward()       }
+    elsif ($ch eq KEY_BACKSPACE)   { page_backward()       }
+    elsif ($ch eq KEY_PPAGE )      { page_backward()       }
+    elsif ($ch =~ /^[ej\n.]$/) { line_forward()        }
+    elsif ($ch eq KEY_DOWN  )      { line_forward()        }
+    elsif ($ch =~ /^[yk,]$/) { line_backward()       }
+    elsif ($ch eq KEY_UP )         { line_backward()       }
+    elsif ($ch =~ /^[f]$/)         { next_entry()          }
+    elsif ($ch =~ /^[b]$/)         { previous_entry()      }
+    elsif ($ch =~ /^[\/]$/)        { search('/')           }
+    elsif ($ch =~ /^[?]$/)         { search('?')           }
+    elsif ($ch =~ /^[n]$/)         { search_next()         }
+    elsif ($ch =~ /^[N]$/)         { search_previous()     }
+    elsif ($ch =~ /^[uU]$/)        { unset_search()        }
+    elsif ($ch =~ /^[o]$/)         { change_dictionary(1)  }
+    elsif ($ch =~ /^[O]$/)         { change_dictionary(-1) }
+    elsif ($ch =~ /^[]$/)        { toggle_strict()       }
+    elsif ($ch =~ /^[]$/)        { toggle_regexp()       }
+    # ALT/ESC prefix
+    elsif ($ch eq "\033") {
+      my $ch2 = getch();
+      if ($ch2 =~ /^[v]/) { page_backward() }
+    }
+  }
+}
+
+sub clear_dictionary_buffer {
+  for my $d (@dictionaries) {
+    $d->{dict}->erade();
+  }
+}
+
+#----------------------------------------------------------------
+# TEXT PROCESSING
+#----------------------------------------------------------------
+
+sub print_fontified_curses {
+  erase;
+  move 0, 0;
+  standend();
+  my @chunks = split / (?=<\/?[ibt]>|<\/?font.*?> )
+		     #| (?<= <\/?[ibt]>|<\/?font.*?> )
+		     /sx, shift;
+  for my $chunk (@chunks) {
+    if    ($chunk =~ s#^<b>##)  { attron( A_BOLD|COLOR_PAIR(1)) }
+    elsif ($chunk =~ s#^</b>##) { attroff(A_BOLD|COLOR_PAIR(1)) }
+    elsif ($chunk =~ s#^<i>##)  { attron (A_BOLD|COLOR_PAIR(2)) }
+    elsif ($chunk =~ s#^</i>##) { attroff(A_BOLD|COLOR_PAIR(2)) }
+    elsif ($chunk =~ s#^<t>##)  { attron (A_BOLD|COLOR_PAIR(3)) }
+    elsif ($chunk =~ s#^</t>##) { attroff(A_BOLD|COLOR_PAIR(3)) }
+    elsif ($chunk =~ s#^<font(.*?)>##s) {
+      attron(A_BOLD|COLOR_PAIR(4));
+      my $tagcontent = $1;
+      printw $1 if $tagcontent =~ /(\n\s*)/;
+    }
+    elsif ($chunk =~ s#^<\/font>##s) {
+      attroff(A_BOLD|COLOR_PAIR(4))
+    }
+    printw $chunk if $chunk;
+  }
+  standend();
+  if ($textsearch) {
+    return highlight($textsearch);
+  }
+}
+
+#----------------------------------------------------------------
+# CALLBACKS: MOVEMENT
+#----------------------------------------------------------------
+
+sub refresh_screen {
+  my $lines = $thes->idem($maxrow) || return;
+  return print_fontified_curses($lines);
+}
+
+sub select_next_dictionary {
+  my $arg = shift || 1;
+  if ($arg > 0) {
+    $selected = ($selected >= $#dictionaries) ? 0 : $selected + 1;
+  }
+  else {
+    $selected = ($selected <= 0) ? $#dictionaries : $selected - 1;
+  }
+  $thes = $dictionaries[$selected]->{dict};
+}
+
+sub change_dictionary {
+  my $arg = shift || 1;
+  while ( select_next_dictionary($arg) ) {
+    last if
+      defined $thes->quaestio()
+      and $thes->quaestio eq $query;
+    last if
+      defined $thes->quaestio()
+      and $thes->quaestio ne ''
+      and $thes->quaere($query);
+    last if
+      not defined $thes->quaestio()
+      and $thes->quaere($query);
+  }
+  my $lines = $thes->idem($maxrow) || return;
+  print_fontified_curses($lines);
+}
+
+sub page_forward {
+  my $lines = $thes->lege_lineas($maxrow) || return;
+  print_fontified_curses($lines)
+}
+
+sub page_backward {
+  my $lines = $thes->lege_lineas(-$maxrow) || return;
+#  my $lines = $thes->lege_lineas(-2) || return;
+  print_fontified_curses($lines)
+}
+
+sub line_forward {
+  my $lines = $thes->lege_lineas($maxrow, 1) || return;
+  print_fontified_curses($lines)
+}
+
+sub line_backward {
+  my $lines = $thes->lege_lineas($maxrow, -1) || return;
+  print_fontified_curses($lines)
+}
+
+sub next_entry {
+  my $lines = $thes->proximum(1, $maxrow) || return;
+  print_fontified_curses($lines)
+}
+
+sub previous_entry {
+  my $lines = $thes->proximum(-1, $maxrow) || return;
+  print_fontified_curses($lines)
+}
+
+#----------------------------------------------------------------
+# CALLBACKS: SEARCHES
+#----------------------------------------------------------------
+
+sub highlight {
+  my $query = shift;
+  my @indices = $thes->quaere_lineas($query, $regexp_buffersearch);
+  for my $index (@indices) {
+    my ($line, $start, $end)  = @$index;
+    my $length = $end - $start;
+    chgat($line, $start, $length, A_REVERSE, 0, undef);
+  }
+  move($maxrow, 0);
+  return @indices;
+}
+
+sub search {
+  my $dir = shift;
+  $searchdir = $dir;
+  refresh_screen();
+  my $query = my $raw = '';
+  my ($input, $decoded);
+  addch($dir);
+  addch($dir) if $regexp_buffersearch;
+  # I-search screen
+  while  ( ($input = getch()) ne "\n" ) {
+    if ($input =~ /[\033]/) {
+      refresh_screen(); return;
+    }
+    if ($input eq KEY_BACKSPACE or
+	$input =~ /[\b\177]/      ) {
+      if ($query) {
+	chop $query;
+	$textsearch = $query;
+      }
+    }
+    elsif ($input eq "") {
+      $regexp_buffersearch = $regexp_buffersearch ? 0 : 1;
+    }
+    else {
+      $raw .= $input;
+      $decoded = $raw;
+      if (eval {$decoded = decode 'UTF-8', $decoded, Encode::FB_CROAK}) {
+	$textsearch = $query .= $decoded;
+	$raw = '';
+      }
+    }
+    refresh_screen();
+    addch($dir) if $regexp_buffersearch;
+    printw("$dir$query");
+  }
+  unless ( refresh_screen() ) { # returns places highlighted
+     search_buffer($query, $dir)
+  }
+  return $query;
+}
+
+sub search_buffer {
+  my ($query, $dir) = @_;
+  my $sign = ($dir eq '/') ? 1 : -1;
+  timeout(0); # non blocking read
+  my @save_start = $thes->initium();
+  my @save_end   = $thes->finis();
+
+  while ( my $lines = $thes->lege_lineas($sign * $maxrow) ) {
+    my @indices = $thes->quaere_lineas($query, $regexp_buffersearch);
+    if (@indices) {
+      $textsearch = $query;
+      timeout(-1);
+      return refresh_screen();
+    }
+    if ( (my $esc = getch) eq "\033" ) {
+      $thes->initium(@save_start);
+      $thes->finis(@save_end);
+      refresh_screen();
+      timeout(-1);
+      return;
+    }
+  }
+  move($maxrow, 0);
+  printw("No match!");
+  $thes->initium(@save_start);
+  $thes->finis(@save_end);
+  timeout(-1);
+}
+
+sub search_next {
+  return unless $textsearch and $searchdir;
+  search_buffer($textsearch, $searchdir);
+}
+
+sub search_previous {
+  return unless $textsearch and $searchdir;
+  my $dir = ($searchdir eq '/') ? '?' : '/';
+  search_buffer($textsearch, $dir);
+}
+
+sub unset_search {
+  $textsearch = $searchdir = undef;
+  refresh_screen();
+}
+
+#---------------------------------------------------------------
+# MODES
+#----------------------------------------------------------------
+
+sub toggle_strict {
+  $strictmode = $strictmode ? 0 : 1;
+  clear_dictionary_buffer();
+  for my $d (@dictionaries) {
+    $d->{dict}->stricte($strictmode);
+  }
+  if ( search_for_query() ) {
+    print_fontified_curses( $thes->lege_lineas($maxrow) );
+  }
+  else { die "No match!\n" }
+}
+
+sub toggle_regexp {
+  $regexp = $regexp ? 0 : 1;
+  clear_dictionary_buffer();
+  for my $d (@dictionaries) {
+    $d->{dict}->regexp($regexp)
+  }
+  if ( search_for_query() ) {
+    print_fontified_curses( $thes->lege_lineas($maxrow) );
+  }
+  else { die "No match!\n" }
+}
+
+
+#----------------------------------------------------------------
+# CLEANUP
+#----------------------------------------------------------------
+
+END { endwin() if $curses;
+      join_threads() if $threaded and not defined $thes;
+    }
+
+=head1 AUTHOR
+
+Michael Neidhart, C<< <mayhoth at gmail.com> >>
+
+=head1 BUGS
+
+Please report any bugs or feature requests to C<bug-thesaurus at rt.cpan.org>, or through
+the web interface at L<https://rt.cpan.org/NoAuth/ReportBug.html?Queue=Thesaurus>.  I will be notified, and then you'll
+automatically be notified of progress on your bug as I make changes.
+
+
+
+=head1 SUPPORT
+
+You can find documentation for this module with the perldoc command.
+
+    perldoc thesaurus
+
+Check also the README.md file that comes with this distribution.
+
+
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2024 by Michael Neidhart.
+
+This is free software, licensed under:
+
+  The GNU General Public License, Version 3, June 2007
+
+
+=cut

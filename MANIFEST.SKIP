@@ -1,0 +1,24 @@
+#!include_default
+# Avoid configuration metadata file
+^MYMETA\.
+
+# Avoid Module::Build generated and utility files.
+^_build
+\bBuild$
+\bBuild.bat$
+\b_build
+\bBuild.COM$
+\bBUILD.COM$
+\bbuild.com$
+^MANIFEST\.SKIP
+
+# Avoid archives of this distribution
+\bThesaurus-[\d\.\_]+
+
+# ignore backup and temp files
+~$          # ignore emacs and vim backup files
+.bak$       # ignore manual backups
+\#          # ignore CVS old revision files and emacs temp files
+
+# avoid git
+^.git
